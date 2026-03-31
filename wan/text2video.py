@@ -25,6 +25,12 @@ from .utils.fm_solvers import (
 )
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 
+TEACACHE_COEFFICIENTS = {
+    '1.3B': [-5.21e+04, 9.23e+03, -5.28e+02, 1.36e+01, -4.99e-02],
+    '14B':  [-3.03e+05, 4.90e+04, -2.65e+03, 5.87e+01, -3.15e-01],
+    '1.3B_no_ret': [2.39e+03, -1.31e+03, 2.01e+02, -8.29e+00, 1.37e-01],
+    '14B_no_ret':  [-5.78e+03, 5.44e+03, -1.81e+03, 2.56e+02, -1.30e+01],
+}
 
 class WanT2V:
 
@@ -38,6 +44,8 @@ class WanT2V:
         dit_fsdp=False,
         use_usp=False,
         t5_cpu=False,
+        teacache_thresh=0.1,
+        use_ret_steps=True,
     ):
         r"""
         Initializes the Wan text-to-video generation model components.
@@ -111,6 +119,47 @@ class WanT2V:
 
         self.sample_neg_prompt = config.sample_neg_prompt
 
+        self._teacache_enabled = (teacache_thresh > 0)
+        if self._teacache_enabled:
+            logging.info(
+                f"TeaCache enabled: thresh={teacache_thresh}, "
+                f"use_ret_steps={use_ret_steps}")
+
+            ckpt_lower = checkpoint_dir.lower()
+            if '1.3b' in ckpt_lower or '1_3b' in ckpt_lower:
+                model_size = '1.3B'
+            else:
+                model_size = '14B'
+
+            if use_ret_steps:
+                coeff_key = model_size
+            else:
+                coeff_key = f'{model_size}_no_ret'
+            coefficients = TEACACHE_COEFFICIENTS[coeff_key]
+            logging.info(
+                f"TeaCache using coefficients for {coeff_key}: {coefficients}")
+
+            self.model.enable_teacache = True
+            self.model.teacache_thresh = teacache_thresh
+            self.model.coefficients = coefficients
+            self.model.cnt = 0
+            self.model.num_steps = 0
+            self.model.use_ret_steps = use_ret_steps
+
+            self.model.accumulated_rel_l1_distance_even = 0
+            self.model.accumulated_rel_l1_distance_odd = 0
+            self.model.previous_e0_even = None
+            self.model.previous_e0_odd = None
+            self.model.previous_residual_even = None
+            self.model.previous_residual_odd = None
+
+        from torchao.quantization import quantize_, Float8DynamicActivationFloat8WeightConfig
+        quantize_(self.model.blocks, Float8DynamicActivationFloat8WeightConfig())
+        for module in self.model.blocks.modules():
+            if isinstance(module, torch.nn.Linear) and module.bias is not None:
+                module.bias = torch.nn.Parameter(module.bias.data.to(torch.bfloat16), requires_grad=False)
+        self.model = torch.compile(self.model)
+
     def generate(self,
                  input_prompt,
                  size=(1280, 720),
@@ -121,7 +170,7 @@ class WanT2V:
                  guide_scale=5.0,
                  n_prompt="",
                  seed=-1,
-                 offload_model=True):
+                 offload_model=False):
         r"""
         Generates video frames from text prompt using diffusion process.
 
@@ -230,13 +279,37 @@ class WanT2V:
             arg_c = {'context': context, 'seq_len': seq_len}
             arg_null = {'context': context_null, 'seq_len': seq_len}
 
+            if self._teacache_enabled:
+                self.model.num_steps = len(timesteps) * 2
+                self.model.cnt = 0
+                if self.model.use_ret_steps:
+                    self.model.ret_steps = 5 * 2
+                    self.model.cutoff_steps = len(timesteps) * 2
+                else:
+                    self.model.ret_steps = 1 * 2
+                    self.model.cutoff_steps = len(timesteps) * 2 - 2
+
+                self.model.accumulated_rel_l1_distance_even = 0
+                self.model.accumulated_rel_l1_distance_odd = 0
+                self.model.previous_e0_even = None
+                self.model.previous_e0_odd = None
+                self.model.previous_residual_even = None
+                self.model.previous_residual_odd = None
+
+                logging.info(
+                    f"TeaCache: num_steps={self.model.num_steps}, "
+                    f"ret_steps={self.model.ret_steps}, "
+                    f"cutoff_steps={self.model.cutoff_steps}, "
+                    f"thresh={self.model.teacache_thresh}")
+
             for _, t in enumerate(tqdm(timesteps)):
                 latent_model_input = latents
                 timestep = [t]
 
                 timestep = torch.stack(timestep)
 
-                self.model.to(self.device)
+                if not next(self.model.parameters()).is_cuda:
+                    self.model.to(self.device)
                 noise_pred_cond = self.model(
                     latent_model_input, t=timestep, **arg_c)[0]
                 noise_pred_uncond = self.model(

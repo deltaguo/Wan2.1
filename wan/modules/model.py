@@ -1,6 +1,6 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import math
-
+import numpy as np
 import torch
 import torch.cuda.amp as amp
 import torch.nn as nn
@@ -571,8 +571,71 @@ class WanModel(ModelMixin, ConfigMixin):
             context=context,
             context_lens=context_lens)
 
-        for block in self.blocks:
-            x = block(x, **kwargs)
+        if getattr(self, 'enable_teacache', False):
+            modulated_inp = e0
+
+            is_even = (self.cnt % 2 == 0)
+
+            if is_even:
+                prev_e0 = self.previous_e0_even
+            else:
+                prev_e0 = self.previous_e0_odd
+
+            should_calc = False
+
+            if self.cnt < self.ret_steps or self.cnt >= self.cutoff_steps:
+                should_calc = True
+                if is_even:
+                    self.accumulated_rel_l1_distance_even = 0
+                else:
+                    self.accumulated_rel_l1_distance_odd = 0
+            elif prev_e0 is not None:
+                rel_l1 = ((modulated_inp - prev_e0).abs().mean() /
+                          prev_e0.abs().mean()).cpu().item()
+                rescaled = np.poly1d(self.coefficients)(rel_l1)
+
+                if is_even:
+                    self.accumulated_rel_l1_distance_even += rescaled
+                    if self.accumulated_rel_l1_distance_even < self.teacache_thresh:
+                        should_calc = False
+                    else:
+                        should_calc = True
+                        self.accumulated_rel_l1_distance_even = 0
+                else:
+                    self.accumulated_rel_l1_distance_odd += rescaled
+                    if self.accumulated_rel_l1_distance_odd < self.teacache_thresh:
+                        should_calc = False
+                    else:
+                        should_calc = True
+                        self.accumulated_rel_l1_distance_odd = 0
+            else:
+                should_calc = True
+
+            if is_even:
+                self.previous_e0_even = modulated_inp.clone()
+            else:
+                self.previous_e0_odd = modulated_inp.clone()
+
+            if should_calc:
+                ori_x = x.clone()
+                for block in self.blocks:
+                    x = block(x, **kwargs)
+                if is_even:
+                    self.previous_residual_even = x - ori_x
+                else:
+                    self.previous_residual_odd = x - ori_x
+            else:
+                if is_even:
+                    x = x + self.previous_residual_even
+                else:
+                    x = x + self.previous_residual_odd
+
+            self.cnt += 1
+            if self.cnt >= self.num_steps:
+                self.cnt = 0
+        else:
+            for block in self.blocks:
+                x = block(x, **kwargs)
 
         # head
         x = self.head(x, e)
